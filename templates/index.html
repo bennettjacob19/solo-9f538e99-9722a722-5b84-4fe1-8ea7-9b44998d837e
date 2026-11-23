@@ -44,6 +44,12 @@
   .p-terminating { background: #fff1e5; color: var(--term); }
   .p-untested { background: #eaeef2; color: var(--muted); }
   .p-out-of-range { background: #f6f8fa; color: var(--muted); text-decoration: line-through; }
+  .p-preparing { background: #fbefff; color: #8250df; }
+  .origin { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px;
+            font-weight: 600; margin-left: 6px; }
+  .o-new { background: #ddf4ff; color: var(--run); }
+  .o-reused { background: #dafbe1; color: var(--ok); }
+  .wt-state { font-size: 11px; color: var(--muted); font-family: ui-monospace, Menlo, monospace; }
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eaeef2; }
   th { color: var(--muted); font-weight: 600; }
@@ -110,15 +116,23 @@
   </div>
 
   <div class="card">
-    <h2>④ 检查任务（各自在独立 worktree 中执行固定脚本）</h2>
+    <h2>④ 检查任务（各自在独立 worktree 中执行固定脚本，同轮内工作树池化复用）</h2>
     <table id="checks-table">
-      <thead><tr><th>#</th><th>提交</th><th>状态</th><th>退出码</th><th>结论</th><th>耗时</th></tr></thead>
+      <thead><tr><th>#</th><th>提交</th><th>工作树</th><th>状态</th><th>退出码</th><th>结论</th><th>耗时</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
 
   <div class="card">
-    <h2>⑤ 事件日志</h2>
+    <h2>⑤ 工作树池（准备 / 检查占用 / 清理 / 移除中的工作树均计入并发上限）</h2>
+    <table id="worktrees-table">
+      <thead><tr><th>工作树</th><th>来源</th><th>状态</th><th>绑定检查</th><th>当前提交</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>⑥ 事件日志</h2>
     <div id="log" class="log"></div>
   </div>
 </main>
@@ -126,8 +140,14 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const STATUS_LABEL = {
-  "pass": "通过", "fail": "失败", "skip": "不可测", "running": "运行中",
+  "pass": "通过", "fail": "失败", "skip": "不可测", "preparing": "准备中",
+  "running": "运行中",
   "terminating": "终止中", "untested": "待测", "out-of-range": "范围外",
+};
+const ORIGIN_LABEL = {"new": "新建工作树", "reused": "复用工作树"};
+const WT_STATE_LABEL = {
+  "preparing": "准备中", "busy": "检查占用", "cleaning": "清理中",
+  "removing": "移除中", "idle": "空闲待命",
 };
 const STATE_LABEL = {
   "idle": ["空闲", "b-idle"], "running": ["定位中", "b-running"],
@@ -211,17 +231,42 @@ function render(s) {
   // 检查任务表
   const kbody = $("checks-table").querySelector("tbody");
   kbody.innerHTML = s.checks.map(k => {
-    const stLabel = k.discarded && k.status === "finished" ? "已丢弃" :
-      (k.status === "terminating" ? "终止中" : (k.status === "running" ? "运行中" : "已完成"));
+    const stLabel = k.skipped_prep ? "准备期跳过" :
+      (k.discarded && k.status === "finished" ? "已丢弃" :
+      (k.status === "preparing" ? "准备中" :
+       k.status === "terminating" ? "终止中" :
+       (k.status === "running" ? "运行中" : "已完成")));
     const cls = k.status === "running" ? "p-running" :
+      (k.status === "preparing" ? "p-preparing" :
       (k.status === "terminating" ? "p-terminating" :
-       (k.discarded ? "p-out-of-range" : "p-" + (k.verdict || "untested")));
-    const verdict = k.verdict ? STATUS_LABEL[k.verdict] : (k.discarded ? "丢弃" : "—");
+       (k.discarded ? "p-out-of-range" : "p-" + (k.verdict || "untested"))));
+    const verdict = k.verdict ? STATUS_LABEL[k.verdict] :
+      (k.skipped_prep ? "未启动" : (k.discarded ? "丢弃" : "—"));
+    const origin = k.worktree_origin
+      ? `<span class="origin o-${k.worktree_origin}" title="${escapeHtml(k.worktree || "")}">` +
+        `${ORIGIN_LABEL[k.worktree_origin]}</span>` : "—";
     return `<tr><td>${k.id}</td><td><code class="sha">${k.short}</code></td>` +
+           `<td>${origin}</td>` +
            `<td><span class="pill ${cls}" title="${escapeHtml(k.terminate_reason || "")}">${stLabel}</span></td>` +
            `<td>${k.exit_code === null ? "—" : k.exit_code}</td><td>${verdict}</td>` +
            `<td>${fmtDur(k)}</td></tr>`;
-  }).join("") || `<tr><td colspan="6" class="muted">暂无检查任务</td></tr>`;
+  }).join("") || `<tr><td colspan="7" class="muted">暂无检查任务</td></tr>`;
+
+  // 工作树池表
+  const wbody = $("worktrees-table").querySelector("tbody");
+  const wts = s.worktrees || [];
+  wbody.innerHTML = wts.map(w => {
+    const origin = w.origin
+      ? `<span class="origin o-${w.origin}">${ORIGIN_LABEL[w.origin] || w.origin}</span>` : "—";
+    const stateCls = w.state === "idle" ? "p-untested"
+      : (w.state === "busy" ? "p-running"
+      : (w.state === "preparing" ? "p-preparing" : "p-terminating"));
+    return `<tr><td><code class="sha">${w.name}</code></td>` +
+           `<td>${origin}</td>` +
+           `<td><span class="pill ${stateCls}">${WT_STATE_LABEL[w.state] || w.state}</span></td>` +
+           `<td>${w.check_id === null ? "—" : "#" + w.check_id}</td>` +
+           `<td>${w.sha ? '<code class="sha">' + w.sha.substring(0, 10) + "</code>" : "—"}</td></tr>`;
+  }).join("") || `<tr><td colspan="5" class="muted">暂无工作树（轮次结束后工作树会全部移除）</td></tr>`;
 
   // 日志
   $("log").innerHTML = s.events.map(e =>
