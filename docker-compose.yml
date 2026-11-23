@@ -1,0 +1,16 @@
+services:
+  bisect:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      REPO_PATH: /data/sample-repo
+      CHECK_SCRIPT: /app/scripts/sample_check.sh
+      WORKTREE_ROOT: /data/worktrees
+      MAX_CONCURRENT: "2"
+    volumes:
+      - bisect-data:/data
+    restart: unless-stopped
+
+volumes:
+  bisect-data:

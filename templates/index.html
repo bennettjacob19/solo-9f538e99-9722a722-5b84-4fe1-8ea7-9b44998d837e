@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Git 构建回归定位</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --ok: #1a7f37; --bad: #cf222e; --skip: #9a6700; --run: #0969da;
+    --term: #bc4c00; --muted: #6e7781; --border: #d0d7de; --bg: #f6f8fa;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: var(--bg); color: #1f2328; }
+  header { background: #24292f; color: #fff; padding: 14px 24px; }
+  header h1 { margin: 0; font-size: 18px; }
+  header .meta { font-size: 12px; color: #adb6c2; margin-top: 4px; }
+  header .meta code { color: #d6dbe2; }
+  main { max-width: 1100px; margin: 20px auto; padding: 0 16px; }
+  .card { background: #fff; border: 1px solid var(--border); border-radius: 8px;
+          padding: 16px; margin-bottom: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 15px; }
+  select, button { font-size: 14px; padding: 6px 10px; border-radius: 6px;
+                   border: 1px solid var(--border); background: #fff; }
+  button { cursor: pointer; }
+  button.primary { background: #1f883d; color: #fff; border-color: #1f883d; }
+  button.primary:disabled { background: #94d3a2; border-color: #94d3a2; cursor: not-allowed; }
+  button.danger { background: #fff; color: var(--bad); border-color: var(--bad); }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .grow { flex: 1; min-width: 220px; }
+  select.grow { width: 100%; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px;
+           font-size: 12px; font-weight: 600; }
+  .b-idle { background: #eaeef2; color: var(--muted); }
+  .b-running { background: #ddf4ff; color: var(--run); }
+  .b-done { background: #dafbe1; color: var(--ok); }
+  .b-ambiguous { background: #fff8c5; color: var(--skip); }
+  .b-aborted { background: #ffebe9; color: var(--bad); }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .p-pass { background: #dafbe1; color: var(--ok); }
+  .p-fail { background: #ffebe9; color: var(--bad); }
+  .p-skip { background: #fff8c5; color: var(--skip); }
+  .p-running { background: #ddf4ff; color: var(--run); }
+  .p-terminating { background: #fff1e5; color: var(--term); }
+  .p-untested { background: #eaeef2; color: var(--muted); }
+  .p-out-of-range { background: #f6f8fa; color: var(--muted); text-decoration: line-through; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eaeef2; }
+  th { color: var(--muted); font-weight: 600; }
+  code.sha { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .result { font-size: 15px; }
+  .result .sha-big { font-family: ui-monospace, Menlo, monospace; font-weight: 700; }
+  .log { background: #0d1117; color: #c9d1d9; border-radius: 6px; padding: 10px 12px;
+         font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+         max-height: 260px; overflow-y: auto; white-space: pre-wrap; }
+  .log .ts { color: #7d8590; }
+  .progress-outer { background: #eaeef2; border-radius: 6px; height: 10px; overflow: hidden; }
+  .progress-inner { background: #1f883d; height: 100%; transition: width .3s; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .error { color: var(--bad); font-size: 13px; }
+  ul.poss { margin: 8px 0; padding-left: 20px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Git 构建回归定位</h1>
+  <div class="meta">
+    仓库 <code id="repo-path">…</code> · 固定脚本 <code id="script-path">…</code> ·
+    并发上限 <span id="max-conc">…</span> · 退出码约定 0=通过 / 1=失败 / 125=不可测
+  </div>
+</header>
+<main>
+  <div class="card">
+    <h2>① 选择边界（假定失败出现后会延续）</h2>
+    <div class="row">
+      <div class="grow">
+        <div class="muted">已知通过（good，较早）</div>
+        <select id="good" class="grow"></select>
+      </div>
+      <div class="grow">
+        <div class="muted">已知失败（bad，较晚）</div>
+        <select id="bad" class="grow"></select>
+      </div>
+      <div style="align-self:flex-end">
+        <button id="start-btn" class="primary">开始定位</button>
+        <button id="reset-btn" class="danger">重置</button>
+      </div>
+    </div>
+    <div id="start-error" class="error"></div>
+  </div>
+
+  <div class="card">
+    <h2>② 进度 <span id="state-badge" class="badge b-idle">加载中…</span></h2>
+    <div class="row" style="margin-bottom:8px">
+      <div>已知通过：<code class="sha" id="known-good">—</code></div>
+      <div>当前最早失败：<code class="sha" id="first-bad">—</code></div>
+      <div class="muted" id="progress-text"></div>
+    </div>
+    <div class="progress-outer"><div id="progress-inner" class="progress-inner" style="width:0%"></div></div>
+    <div id="result" class="result" style="margin-top:12px"></div>
+  </div>
+
+  <div class="card">
+    <h2>③ 候选提交</h2>
+    <table id="commits-table">
+      <thead><tr><th>提交</th><th>说明</th><th>状态</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>④ 检查任务（各自在独立 worktree 中执行固定脚本）</h2>
+    <table id="checks-table">
+      <thead><tr><th>#</th><th>提交</th><th>状态</th><th>退出码</th><th>结论</th><th>耗时</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>⑤ 事件日志</h2>
+    <div id="log" class="log"></div>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const STATUS_LABEL = {
+  "pass": "通过", "fail": "失败", "skip": "不可测", "running": "运行中",
+  "terminating": "终止中", "untested": "待测", "out-of-range": "范围外",
+};
+const STATE_LABEL = {
+  "idle": ["空闲", "b-idle"], "running": ["定位中", "b-running"],
+  "done": ["已确定首个失败提交", "b-done"],
+  "ambiguous": ["无法唯一确定", "b-ambiguous"],
+  "aborted": ["已中止", "b-aborted"],
+};
+function fmtTs(t) {
+  if (!t) return "—";
+  const d = new Date(t * 1000);
+  return d.toLocaleTimeString("zh-CN", {hour12: false});
+}
+function fmtDur(c) {
+  if (!c.started_at) return "—";
+  const end = c.finished_at || Date.now() / 1000;
+  return (end - c.started_at).toFixed(1) + "s";
+}
+function shaText(info) { return info ? info.short : "—"; }
+
+async function loadCommits() {
+  const res = await fetch("/api/commits");
+  const data = await res.json();
+  const good = $("good"), bad = $("bad");
+  good.innerHTML = ""; bad.innerHTML = "";
+  if (data.error) { $("start-error").textContent = data.error; return; }
+  data.commits.forEach((c, i) => {
+    const label = `${c.short}  ${c.subject}`;
+    good.add(new Option(label, c.sha));
+    bad.add(new Option(label, c.sha));
+  });
+  if (data.commits.length >= 2) {
+    good.selectedIndex = data.commits.length - 3 >= 0 ? data.commits.length - 3 : 0;
+    bad.selectedIndex = data.commits.length - 1;
+  }
+}
+
+function render(s) {
+  $("repo-path").textContent = s.repo_path;
+  $("script-path").textContent = s.script_path;
+  $("max-conc").textContent = s.max_concurrent;
+  const [label, cls] = STATE_LABEL[s.state] || [s.state, "b-idle"];
+  const badge = $("state-badge");
+  badge.textContent = label;
+  badge.className = "badge " + cls;
+
+  $("known-good").textContent = shaText(s.known_good);
+  $("first-bad").textContent = shaText(s.first_bad);
+  const p = s.progress;
+  $("progress-text").textContent = s.state === "idle" ? "" :
+    `已测 ${p.tested}/${p.total} · 待测 ${p.remaining} · 在跑 ${p.active}/${s.max_concurrent} · 范围内剩余 ${p.range_size}`;
+  $("progress-inner").style.width = p.total ? (100 * p.tested / p.total) + "%" : "0%";
+
+  // 结果区
+  const r = $("result");
+  if (s.state === "done" && s.answer) {
+    r.innerHTML = `✅ 首个失败提交：<span class="sha-big">${s.answer.sha}</span> ` +
+      `<span class="muted">${escapeHtml(s.answer.subject)}</span>`;
+  } else if (s.state === "ambiguous" && s.possibilities) {
+    r.innerHTML = `⚠️ 存在不可测提交，无法唯一确定首个失败提交。可能的 SHA：` +
+      "<ul class='poss'>" + s.possibilities.map(x =>
+        `<li><code class="sha">${x.sha}</code> <span class="muted">${escapeHtml(x.subject)}</span></li>`).join("") +
+      "</ul>";
+  } else if (s.state === "aborted") {
+    r.innerHTML = `⛔ 本轮已中止：${escapeHtml(s.abort_reason || "")}`;
+  } else if (s.state === "running") {
+    r.innerHTML = `<span class="muted">二分进行中……</span>`;
+  } else {
+    r.innerHTML = `<span class="muted">选择 good / bad 边界后点击“开始定位”。</span>`;
+  }
+
+  // 候选提交表
+  const cbody = $("commits-table").querySelector("tbody");
+  cbody.innerHTML = s.commits.map(c => {
+    const st = c.is_bad_boundary && c.status !== "out-of-range" ? "fail" : c.status;
+    const pill = `<span class="pill p-${c.status}">${STATUS_LABEL[c.status] || c.status}</span>`;
+    const bnd = c.is_bad_boundary ? ' <span class="muted">(bad 边界)</span>' : "";
+    return `<tr><td><code class="sha">${c.short}</code></td>` +
+           `<td>${escapeHtml(c.subject)}${bnd}</td><td>${pill}</td></tr>`;
+  }).join("") || `<tr><td colspan="3" class="muted">尚未开始</td></tr>`;
+
+  // 检查任务表
+  const kbody = $("checks-table").querySelector("tbody");
+  kbody.innerHTML = s.checks.map(k => {
+    const stLabel = k.discarded && k.status === "finished" ? "已丢弃" :
+      (k.status === "terminating" ? "终止中" : (k.status === "running" ? "运行中" : "已完成"));
+    const cls = k.status === "running" ? "p-running" :
+      (k.status === "terminating" ? "p-terminating" :
+       (k.discarded ? "p-out-of-range" : "p-" + (k.verdict || "untested")));
+    const verdict = k.verdict ? STATUS_LABEL[k.verdict] : (k.discarded ? "丢弃" : "—");
+    return `<tr><td>${k.id}</td><td><code class="sha">${k.short}</code></td>` +
+           `<td><span class="pill ${cls}" title="${escapeHtml(k.terminate_reason || "")}">${stLabel}</span></td>` +
+           `<td>${k.exit_code === null ? "—" : k.exit_code}</td><td>${verdict}</td>` +
+           `<td>${fmtDur(k)}</td></tr>`;
+  }).join("") || `<tr><td colspan="6" class="muted">暂无检查任务</td></tr>`;
+
+  // 日志
+  $("log").innerHTML = s.events.map(e =>
+    `<div><span class="ts">${fmtTs(e.ts)}</span> ${escapeHtml(e.msg)}</div>`).join("");
+  $("log").scrollTop = $("log").scrollHeight;
+
+  $("start-btn").disabled = s.state === "running";
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+}
+
+async function refresh() {
+  try {
+    const res = await fetch("/api/status");
+    render(await res.json());
+  } catch (e) { /* 忽略瞬时错误 */ }
+}
+
+$("start-btn").addEventListener("click", async () => {
+  $("start-error").textContent = "";
+  const res = await fetch("/api/start", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({good: $("good").value, bad: $("bad").value}),
+  });
+  const data = await res.json();
+  if (!res.ok) $("start-error").textContent = data.error || "启动失败";
+  refresh();
+});
+$("reset-btn").addEventListener("click", async () => {
+  await fetch("/api/reset", {method: "POST"});
+  refresh();
+});
+
+loadCommits().then(refresh);
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
